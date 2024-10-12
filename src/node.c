@@ -16,7 +16,7 @@
 #endif
 
 /* Connect to remote QP */
-int node_connect(struct node *n, struct peer_info *p, int id) {
+int node_connect(struct node *n, struct peer_info *p, int plane, int id) {
   int ret;
   struct ibv_qp_attr rtr_attr = {
       .qp_state = IBV_QPS_RTR,
@@ -42,11 +42,11 @@ int node_connect(struct node *n, struct peer_info *p, int id) {
     rtr_attr.ah_attr.grh.dgid.raw[i] = p->gid[i];
 #endif
 
-  if ((ret = ibv_modify_qp(n->qp[id], &rtr_attr,
-                           IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
-                               IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
-                               IBV_QP_MAX_DEST_RD_ATOMIC |
-                               IBV_QP_MIN_RNR_TIMER)))
+  if ((ret =
+           ibv_modify_qp(n->qp[plane][id], &rtr_attr,
+                         IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+                             IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
+                             IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER)))
     return ret;
 
   struct ibv_qp_attr rts_attr;
@@ -58,22 +58,24 @@ int node_connect(struct node *n, struct peer_info *p, int id) {
   rts_attr.sq_psn = 0;
   rts_attr.max_rd_atomic = 1;
 
-  return ibv_modify_qp(n->qp[id], &rts_attr,
+  return ibv_modify_qp(n->qp[plane][id], &rts_attr,
                        IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
                            IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
                            IBV_QP_MAX_QP_RD_ATOMIC);
 }
 
 /* Free any resources */
-void node_destroy(struct node **node) {
-  struct node *n = *node;
-  for (int i = 0; i < NODES - 1; ++i)
-    ibv_destroy_qp(n->qp[i]);
-  ibv_dereg_mr(n->mr);
-  ibv_destroy_cq(n->cq);
+void node_destroy(struct node *n) {
+  for (int i = 0; i < NODES - 1; ++i) {
+    ibv_destroy_qp(n->qp[MU_REPLICATION_PLANE][i]);
+    ibv_destroy_qp(n->qp[MU_BACKGROUND_PLANE][i]);
+  }
+  ibv_dereg_mr(n->mr[MU_REPLICATION_PLANE]);
+  ibv_dereg_mr(n->mr[MU_BACKGROUND_PLANE]);
+  ibv_destroy_cq(n->cq[MU_REPLICATION_PLANE]);
+  ibv_destroy_cq(n->cq[MU_BACKGROUND_PLANE]);
   ibv_dealloc_pd(n->pd);
   ibv_close_device(n->ctx);
-  free(node);
 }
 
 /* Serialize peer info. Buffer must be at least of size PEER_INFO_LEN */
@@ -100,22 +102,14 @@ void peer_info_unpack(char *buf, struct peer_info *p) {
 }
 
 /* Initialize a node */
-int node_init(struct node **node) {
-  struct node *n;
-  int i, local, ret;
+int node_init(struct node *n) {
+  int local, ret;
   struct ibv_device **dev_list;
-
-  if (!(*node = malloc(sizeof(struct node) + MU_LOG_SIZE))) {
-    perror("malloc:");
-    return errno;
-  }
 
   if ((ret = find_host_ipv4(&local)) || local < 0) {
     fprintf(stderr, "Host not found in configuration.");
     return ret;
   }
-
-  n = *node;
   n->host = peers + local;
 
   if (!(dev_list = ibv_get_device_list(NULL))) {
@@ -123,8 +117,7 @@ int node_init(struct node **node) {
     return errno;
   }
 
-  n->ctx = ibv_open_device(dev_list[0]);
-  if (!n->ctx) {
+  if (!(n->ctx = ibv_open_device(dev_list[0]))) {
     fprintf(stderr, "ibv_open_device failed");
     return errno;
   }
@@ -144,49 +137,56 @@ int node_init(struct node **node) {
     return errno;
   }
 
-  n->pd = ibv_alloc_pd(n->ctx);
-  if (!n->pd) {
+  if (!(n->pd = ibv_alloc_pd(n->ctx))) {
     fprintf(stderr, "ibv_alloc_pd failed");
     return errno;
   }
 
-  n->mr = ibv_reg_mr(n->pd, n->log, MU_LOG_SIZE, IBV_ACCESS_LOCAL_WRITE);
-  if (!n->mr) {
+  if (!(n->mr[MU_REPLICATION_PLANE] =
+            ibv_reg_mr(n->pd, &n->log, MU_LOG_SIZE, IBV_ACCESS_LOCAL_WRITE))) {
     fprintf(stderr, "ibv_reg_mr failed");
     return errno;
   }
 
-  n->cq = ibv_create_cq(n->ctx, 10, NULL, NULL, 0);
-  if (!n->cq) {
-    fprintf(stderr, "ibv_create_cq failed");
+  if (!(n->mr[MU_BACKGROUND_PLANE] =
+            ibv_reg_mr(n->pd, &n->bg, MU_LOG_SIZE, IBV_ACCESS_LOCAL_WRITE))) {
+    fprintf(stderr, "ibv_reg_mr failed");
     return errno;
   }
 
-  struct ibv_qp_init_attr init_attr = {.send_cq = n->cq,
-                                       .recv_cq = n->cq,
-                                       .cap = {.max_send_wr = 1,
-                                               .max_recv_wr = MAX_RECV_WR,
-                                               .max_send_sge = 1,
-                                               .max_recv_sge = 1},
-                                       .qp_type = IBV_QPT_RC};
+#pragma GCC unroll 2
+  for (int i = 0; i < 2; ++i)
+    if (!(n->cq[i] = ibv_create_cq(n->ctx, 10, NULL, NULL, 0))) {
+      fprintf(stderr, "ibv_create_cq failed");
+      return errno;
+    }
 
   struct ibv_qp_attr attr = {.qp_state = IBV_QPS_INIT,
                              .pkey_index = 0,
                              .port_num = n->host->ib_port,
                              .qp_access_flags = 0};
 
-  for (i = 0; i < NODES - 1; ++i) {
-    n->qp[i] = ibv_create_qp(n->pd, &init_attr);
-    if (!n->qp[i]) {
-      fprintf(stderr, "ibv_create_qp failed");
-      return errno;
-    }
+#pragma GCC unroll 2
+  for (int i = 0; i < 2; ++i) {
+    struct ibv_qp_init_attr init_attr = {.send_cq = n->cq[i],
+                                         .recv_cq = n->cq[i],
+                                         .cap = {.max_send_wr = 1,
+                                                 .max_recv_wr = MAX_RECV_WR,
+                                                 .max_send_sge = 1,
+                                                 .max_recv_sge = 1},
+                                         .qp_type = IBV_QPT_RC};
 
-    if (ibv_modify_qp(n->qp[i], &attr,
-                      IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
-                          IBV_QP_ACCESS_FLAGS)) {
-      fprintf(stderr, "ibv_modify_qp failed");
-      return errno;
+    for (int j = 0; j < NODES - 1; ++j) {
+      if (!(n->qp[i][j] = ibv_create_qp(n->pd, &init_attr))) {
+        fprintf(stderr, "ibv_create_qp failed");
+        return errno;
+      }
+      if (ibv_modify_qp(n->qp[i][j], &attr,
+                        IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
+                            IBV_QP_ACCESS_FLAGS)) {
+        fprintf(stderr, "ibv_modify_qp failed");
+        return errno;
+      }
     }
   }
 
@@ -222,10 +222,14 @@ int node_run(struct node *n) {
     pthread_join(ct[i], (void **)(info + i));
     if (!info[i])
       return errno;
-    if ((ret = node_connect(n, info[i], i)))
-      return ret;
-    printf("[node] Established RDMA connection with peer %s on QP %d\n",
-           a[i + 1].p->addr, n->qp[i]->qp_num);
+#pragma GCC unroll 2
+    for (int j = 0; j < 2; ++j) {
+      if ((ret = node_connect(n, info[i] + j, j, i)))
+        return ret;
+      printf("[node] Established RDMA connection with peer %s on QP %d\n",
+             a[i + 1].p->addr, n->qp[j][i]->qp_num);
+    }
+    free(info[i]);
   }
 
   /* Main server loop blocks here */

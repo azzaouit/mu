@@ -3,7 +3,7 @@
 
 int main() {
   int ret = 0;
-  struct node *n = NULL;
+  struct node n;
 
   printf("Network Configuration\n");
   printf("=============================\n");
@@ -11,10 +11,10 @@ int main() {
     printf("%s:%d\n", peers[i].addr, peers[i].port);
   printf("=============================\n");
 
-  if ((ret = node_init(&n)) || !n)
+  if ((ret = node_init(&n)))
     return ret;
 
-  ret = node_run(n);
+  ret = node_run(&n);
   node_destroy(&n);
   return ret;
 }

@@ -72,10 +72,12 @@ int peer_addr2id(struct node *n, char *addr) {
 }
 
 /* Extract peer info for this host to send over to a client */
-void local_peer_info(struct node *n, struct peer_info *p, int qp_id) {
-  p->addr = (uint64_t)n->log;
-  p->rkey = n->mr->rkey;
-  p->qp_num = n->qp[qp_id]->qp_num;
+void local_peer_info(struct node *n, struct peer_info *p, int plane,
+                     int qp_id) {
+  p->addr =
+      (plane == MU_REPLICATION_PLANE ? (uint64_t)&n->log : (uint64_t)&n->bg);
+  p->rkey = n->mr[plane]->rkey;
+  p->qp_num = n->qp[plane][qp_id]->qp_num;
   p->lid = n->portinfo.lid;
   for (int i = 0; i < 16; ++i)
     p->gid[i] = n->gid.raw[i];
@@ -85,8 +87,8 @@ void *server_thread(void *ptr) {
   socklen_t clientlen;
   struct peer_info local;
   struct sockaddr_in server, client;
-  int serverfd, clientfd, nbytes, optval = 1;
   char *hostaddrp, buf[PEER_INFO_LEN] = {0};
+  int serverfd, clientfd, nbytes, optval = 1;
   struct node *n = ((struct thread_args *)ptr)->n;
   struct peer *p = ((struct thread_args *)ptr)->p;
 
@@ -115,7 +117,7 @@ void *server_thread(void *ptr) {
   printf("[tcp/server] Server listening on %s:%d\n", p->addr, p->port);
 
   clientlen = sizeof(client);
-  while (1) {
+  for (int npeers = 0; npeers < NODES - 1; ++npeers)
     if ((clientfd = accept(serverfd, (struct sockaddr *)&client, &clientlen)) <
         0)
       perror("accept:");
@@ -130,23 +132,22 @@ void *server_thread(void *ptr) {
         continue;
       }
 
-      local_peer_info(n, &local, pid);
+      local_peer_info(n, &local, MU_REPLICATION_PLANE, pid);
       peer_info_pack(&local, buf);
-
-      printf("[tcp/server] Local peer info = {%lx, %x, %x, %x}\n", local.addr,
-             local.rkey, local.qp_num, local.lid);
-
-      printf("[tcp/server] Local GID = ");
-      for (int i = 0; i < 16; ++i)
-        printf("%x", local.gid[i]);
-      printf("\n");
-
       if ((nbytes = write(clientfd, buf, sizeof buf)) != PEER_INFO_LEN)
         perror("write:");
-      printf("[tcp/server] Sent %d bytes to %s\n", nbytes, hostaddrp);
+
+      printf("[tcp/server] (1/2) Sent %d bytes to %s\n", nbytes, hostaddrp);
+
+      local_peer_info(n, &local, MU_BACKGROUND_PLANE, pid);
+      peer_info_pack(&local, buf);
+      if ((nbytes = write(clientfd, buf, sizeof buf)) != PEER_INFO_LEN)
+        perror("write:");
+
+      printf("[tcp/server] (2/2) Sent %d bytes to %s\n", nbytes, hostaddrp);
+
       close(clientfd);
     }
-  }
 
 err:
   close(serverfd);
@@ -160,7 +161,7 @@ void *client_thread(void *ptr) {
   char buf[PEER_INFO_LEN] = {0};
   struct peer *p = ((struct thread_args *)ptr)->p;
 
-  if (!(remote_pi = malloc(sizeof(struct peer_info)))) {
+  if (!(remote_pi = malloc(sizeof(struct peer_info) * 2))) {
     perror("malloc:");
     pthread_exit(NULL);
   }
@@ -199,14 +200,19 @@ void *client_thread(void *ptr) {
     perror("read:");
     goto err;
   }
-
   peer_info_unpack(buf, remote_pi);
-  fprintf(stderr, "[tcp/client] Read %d bytes from %s:%d.\n", nbytes, p->addr,
-          p->port);
-  printf("[tcp/client] Remote peer info = {%lx, %x, %x, %x}\n", remote_pi->addr,
-         remote_pi->rkey, remote_pi->qp_num, remote_pi->lid);
-  close(sockfd);
+  fprintf(stderr, "[tcp/client] (1/2) Read %d bytes from %s:%d.\n", nbytes,
+          p->addr, p->port);
 
+  if ((nbytes = read(sockfd, buf, PEER_INFO_LEN)) != PEER_INFO_LEN) {
+    perror("read:");
+    goto err;
+  }
+  peer_info_unpack(buf, remote_pi + 1);
+  fprintf(stderr, "[tcp/client] (2/2) Read %d bytes from %s:%d.\n", nbytes,
+          p->addr, p->port);
+
+  close(sockfd);
   pthread_exit(remote_pi);
 
 err:
