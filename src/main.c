@@ -7,7 +7,7 @@ int main() {
 
   printf("Network Configuration\n");
   printf("=============================\n");
-  for (int i = 0; i < NODES; ++i)
+  for (size_t i = 0; i < MU_PEERS; ++i)
     printf("%s:%d\n", peers[i].addr, peers[i].port);
   printf("=============================\n");
 

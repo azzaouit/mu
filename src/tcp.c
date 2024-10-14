@@ -16,58 +16,11 @@
 #define MAX_IF (1 << 3)
 #define MAX_RETRIES 5
 
-/* Scan through connected interfaces and look
- * for our peer entry in the peer list */
-int find_host_ipv4(int *p) {
-  int sockfd, n, ret = 0;
-  struct ifconf ifconf;
-  struct ifreq ifr[MAX_IF];
-  char ip[INET_ADDRSTRLEN];
-
-  if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-    perror("socket:");
-    return errno;
-  }
-
-  ifconf.ifc_buf = (char *)ifr;
-  ifconf.ifc_len = sizeof ifr;
-
-  if (ioctl(sockfd, SIOCGIFCONF, &ifconf) < 0) {
-    perror("ioctl:");
-    goto error;
-  }
-
-  n = ifconf.ifc_len / sizeof(ifr[0]);
-
-  *p = -1;
-  for (int i = 0; i < n; ++i) {
-    struct sockaddr_in *s_in = (struct sockaddr_in *)&ifr[i].ifr_addr;
-    if (!inet_ntop(AF_INET, &s_in->sin_addr, ip, sizeof(ip))) {
-      perror("inet_ntop:");
-      goto error;
-    }
-    for (int j = 0; j < NODES; ++j)
-      if (!strcmp(ip, peers[j].addr)) {
-        *p = j;
-        goto done;
-      }
-  }
-
-  errno = EINVAL;
-error:
-  ret = errno;
-done:
-  close(sockfd);
-  return ret;
-}
-
-/* Find the global id of this host in the network configuration */
-int peer_addr2id(struct node *n, char *addr) {
-  for (int i = 0, j = 0; i < NODES; ++i) {
-    if (!strcmp(peers[i].addr, addr))
-      return j;
-    j += (strcmp(peers[i].addr, n->host->addr) != 0);
-  }
+/* Validate a connecting peer by checking the peer list */
+int valid_peer(const char *p) {
+  for (int i = 0; i < MU_PEERS; ++i)
+    if (!strcmp(p, peers[i].addr))
+      return i;
   return -1;
 }
 
@@ -87,10 +40,9 @@ void *server_thread(void *ptr) {
   socklen_t clientlen;
   struct peer_info local;
   struct sockaddr_in server, client;
+  struct node *n = (struct node *)ptr;
   char *hostaddrp, buf[PEER_INFO_LEN] = {0};
-  int serverfd, clientfd, nbytes, optval = 1;
-  struct node *n = ((struct thread_args *)ptr)->n;
-  struct peer *p = ((struct thread_args *)ptr)->p;
+  int pid, serverfd, clientfd, nbytes, optval = 1;
 
   if ((serverfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
     perror("socket:");
@@ -102,7 +54,7 @@ void *server_thread(void *ptr) {
   bzero((char *)&server, sizeof(server));
   server.sin_family = AF_INET;
   server.sin_addr.s_addr = htonl(INADDR_ANY);
-  server.sin_port = htons(p->port);
+  server.sin_port = htons(MU_TCP_PORT);
 
   if (bind(serverfd, (struct sockaddr *)&server, sizeof(server)) < 0) {
     perror("bind:");
@@ -114,10 +66,10 @@ void *server_thread(void *ptr) {
     goto err;
   }
 
-  printf("[tcp/server] Server listening on %s:%d\n", p->addr, p->port);
+  printf("[tcp/server] Server listening on port %d\n", MU_TCP_PORT);
 
   clientlen = sizeof(client);
-  for (int npeers = 0; npeers < NODES - 1; ++npeers)
+  for (int npeers = 0; npeers < MU_PEERS; ++npeers)
     if ((clientfd = accept(serverfd, (struct sockaddr *)&client, &clientlen)) <
         0)
       perror("accept:");
@@ -125,8 +77,7 @@ void *server_thread(void *ptr) {
       hostaddrp = inet_ntoa(client.sin_addr);
       printf("[tcp/server] Established connection with %s\n", hostaddrp);
 
-      int pid = peer_addr2id(n, hostaddrp);
-      if (pid < 0) {
+      if ((pid = valid_peer(hostaddrp)) < 0) {
         fprintf(stderr, "[tcp/server] %s not found in network configuration.\n",
                 hostaddrp);
         continue;
@@ -137,14 +88,10 @@ void *server_thread(void *ptr) {
       if ((nbytes = write(clientfd, buf, sizeof buf)) != PEER_INFO_LEN)
         perror("write:");
 
-      printf("[tcp/server] (1/2) Sent %d bytes to %s\n", nbytes, hostaddrp);
-
       local_peer_info(n, &local, MU_BACKGROUND_PLANE, pid);
       peer_info_pack(&local, buf);
       if ((nbytes = write(clientfd, buf, sizeof buf)) != PEER_INFO_LEN)
         perror("write:");
-
-      printf("[tcp/server] (2/2) Sent %d bytes to %s\n", nbytes, hostaddrp);
 
       close(clientfd);
     }
@@ -156,15 +103,12 @@ err:
 
 void *client_thread(void *ptr) {
   int i, sockfd, nbytes;
-  struct peer_info *remote_pi;
   struct sockaddr_in serveraddr;
   char buf[PEER_INFO_LEN] = {0};
-  struct peer *p = ((struct thread_args *)ptr)->p;
-
-  if (!(remote_pi = malloc(sizeof(struct peer_info) * 2))) {
-    perror("malloc:");
-    pthread_exit(NULL);
-  }
+  struct node *n = ((struct client_args *)ptr)->n;
+  int id = ((struct client_args *)ptr)->id;
+  int *ret = &((struct client_args *)ptr)->ret;
+  struct peer *p = peers + id;
 
   if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
     perror("socket:");
@@ -193,30 +137,37 @@ void *client_thread(void *ptr) {
 
   if (i >= MAX_RETRIES) {
     fprintf(stderr, "[tcp/client] %s:%d unreachable.\n", p->addr, p->port);
-    goto err;
+    *ret = 1;
+    goto exit;
   }
 
   if ((nbytes = read(sockfd, buf, PEER_INFO_LEN)) != PEER_INFO_LEN) {
     perror("read:");
-    goto err;
+    *ret = errno;
+    goto exit;
   }
-  peer_info_unpack(buf, remote_pi);
-  fprintf(stderr, "[tcp/client] (1/2) Read %d bytes from %s:%d.\n", nbytes,
-          p->addr, p->port);
+  peer_info_unpack(buf, n->pi[id] + MU_REPLICATION_PLANE);
 
   if ((nbytes = read(sockfd, buf, PEER_INFO_LEN)) != PEER_INFO_LEN) {
     perror("read:");
-    goto err;
+    *ret = errno;
+    goto exit;
   }
-  peer_info_unpack(buf, remote_pi + 1);
-  fprintf(stderr, "[tcp/client] (2/2) Read %d bytes from %s:%d.\n", nbytes,
-          p->addr, p->port);
+  peer_info_unpack(buf, n->pi[id] + MU_BACKGROUND_PLANE);
 
-  close(sockfd);
-  pthread_exit(remote_pi);
+  if (node_connect(n, MU_REPLICATION_PLANE, id)) {
+    fprintf(stderr, "[tcp/client] Replication QP Connection failed.\n");
+    *ret = 2;
+    goto exit;
+  }
 
-err:
-  free(remote_pi);
+  if (node_connect(n, MU_BACKGROUND_PLANE, id)) {
+    fprintf(stderr, "[tcp/client] Background QP Connection failed.\n");
+    *ret = 3;
+    goto exit;
+  }
+
+exit:
   close(sockfd);
   pthread_exit(NULL);
 }

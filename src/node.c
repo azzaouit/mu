@@ -16,8 +16,9 @@
 #endif
 
 /* Connect to remote QP */
-int node_connect(struct node *n, struct peer_info *p, int plane, int id) {
+int node_connect(struct node *n, int plane, int id) {
   int ret;
+  struct peer_info *p = n->pi[id] + plane;
   struct ibv_qp_attr rtr_attr = {
       .qp_state = IBV_QPS_RTR,
       .path_mtu = IBV_MTU_1024,
@@ -27,7 +28,7 @@ int node_connect(struct node *n, struct peer_info *p, int plane, int id) {
       .ah_attr.is_global = 0,
       .ah_attr.sl = 0,
       .ah_attr.src_path_bits = 0,
-      .ah_attr.port_num = n->host->ib_port,
+      .ah_attr.port_num = MU_IB_PORT,
       .dest_qp_num = p->qp_num,
       .ah_attr.dlid = p->lid,
   };
@@ -36,7 +37,7 @@ int node_connect(struct node *n, struct peer_info *p, int plane, int id) {
   rtr_attr.ah_attr.is_global = 1;
   rtr_attr.ah_attr.grh.flow_label = 0;
   rtr_attr.ah_attr.grh.hop_limit = 1;
-  rtr_attr.ah_attr.grh.sgid_index = n->host->gid_index;
+  rtr_attr.ah_attr.grh.sgid_index = MU_GID_INDEX;
   rtr_attr.ah_attr.grh.traffic_class = 0;
   for (int i = 0; i < 16; ++i)
     rtr_attr.ah_attr.grh.dgid.raw[i] = p->gid[i];
@@ -66,7 +67,7 @@ int node_connect(struct node *n, struct peer_info *p, int plane, int id) {
 
 /* Free any resources */
 void node_destroy(struct node *n) {
-  for (int i = 0; i < NODES - 1; ++i) {
+  for (int i = 0; i < MU_PEERS; ++i) {
     ibv_destroy_qp(n->qp[MU_REPLICATION_PLANE][i]);
     ibv_destroy_qp(n->qp[MU_BACKGROUND_PLANE][i]);
   }
@@ -103,14 +104,7 @@ void peer_info_unpack(char *buf, struct peer_info *p) {
 
 /* Initialize a node */
 int node_init(struct node *n) {
-  int local, ret;
   struct ibv_device **dev_list;
-
-  if ((ret = find_host_ipv4(&local)) || local < 0) {
-    fprintf(stderr, "Host not found in configuration.");
-    return ret;
-  }
-  n->host = peers + local;
 
   if (!(dev_list = ibv_get_device_list(NULL))) {
     fprintf(stderr, "ibv_get_device_list failed");
@@ -126,13 +120,13 @@ int node_init(struct node *n) {
   ibv_free_device_list(dev_list);
 
 #ifdef MU_USE_ROCEE
-  if (ibv_query_gid(n->ctx, n->host->ib_port, n->host->gid_index, &n->gid)) {
+  if (ibv_query_gid(n->ctx, MU_IB_PORT, MU_GID_INDEX, &n->gid)) {
     fprintf(stderr, "ibv_query_gid failed\n");
     return errno;
   }
 #endif
 
-  if (ibv_query_port(n->ctx, n->host->ib_port, &n->portinfo)) {
+  if (ibv_query_port(n->ctx, MU_IB_PORT, &n->portinfo)) {
     fprintf(stderr, "ibv_query_port failed\n");
     return errno;
   }
@@ -163,7 +157,7 @@ int node_init(struct node *n) {
 
   struct ibv_qp_attr attr = {.qp_state = IBV_QPS_INIT,
                              .pkey_index = 0,
-                             .port_num = n->host->ib_port,
+                             .port_num = MU_IB_PORT,
                              .qp_access_flags = 0};
 
 #pragma GCC unroll 2
@@ -176,7 +170,7 @@ int node_init(struct node *n) {
                                                  .max_recv_sge = 1},
                                          .qp_type = IBV_QPT_RC};
 
-    for (int j = 0; j < NODES - 1; ++j) {
+    for (int j = 0; j < MU_PEERS; ++j) {
       if (!(n->qp[i][j] = ibv_create_qp(n->pd, &init_attr))) {
         fprintf(stderr, "ibv_create_qp failed");
         return errno;
@@ -195,41 +189,34 @@ int node_init(struct node *n) {
 
 /* Run node (blocking) */
 int node_run(struct node *n) {
-  int ret = 0;
-  pthread_t st, ct[NODES - 1];
-  struct thread_args a[NODES];
-  struct peer_info *info[NODES - 1];
+  int ret;
+  pthread_t st, ct[MU_PEERS];
+  struct client_args a[MU_PEERS];
 
-  a[0].n = n;
-  a[0].p = n->host;
-  if (pthread_create(&st, NULL, server_thread, (void *)a)) {
+  if (pthread_create(&st, NULL, server_thread, (void *)n)) {
     perror("pthread_create:");
     return errno;
   }
 
-  for (int i = 0, j = 0; i < NODES; ++i)
-    if (peers + i != n->host) {
-      a[j + 1].n = n;
-      a[j + 1].p = peers + i;
-      if (pthread_create(ct + j, NULL, client_thread, (void *)(a + j + 1))) {
-        perror("pthread_create:");
-        return errno;
-      }
-      ++j;
-    }
-
-  for (int i = 0; i < NODES - 1; ++i) {
-    pthread_join(ct[i], (void **)(info + i));
-    if (!info[i])
+  for (int i = 0; i < MU_PEERS; ++i) {
+    a[i].n = n;
+    a[i].id = i;
+    a[i].ret = 0;
+    if (pthread_create(ct + i, NULL, client_thread, (void *)(a + i))) {
+      perror("pthread_create:");
       return errno;
-#pragma GCC unroll 2
-    for (int j = 0; j < 2; ++j) {
-      if ((ret = node_connect(n, info[i] + j, j, i)))
-        return ret;
-      printf("[node] Established RDMA connection with peer %s on QP %d\n",
-             a[i + 1].p->addr, n->qp[j][i]->qp_num);
     }
-    free(info[i]);
+  }
+
+  for (int i = 0; i < MU_PEERS; ++i) {
+    pthread_join(ct[i], NULL);
+    if (a[i].ret) {
+      fprintf(stderr, "[node] Client thread %d returned with exit code %d\n", i,
+              a[i].ret);
+      return a[i].ret;
+    }
+    fprintf(stderr, "[node] Established RDMA connection with peer %s\n",
+            peers[i].addr);
   }
 
   /* Main server loop blocks here */
