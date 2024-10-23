@@ -1,0 +1,20 @@
+Dependencies
+------------
+
+libibverbs-dev libssl-dev
+
+Build
+-----
+
+cmake -B build
+make -C build
+
+HW Requirements
+---------------
+
+RDMA NIC, OFED drivers
+
+Configuration
+-------------
+
+cp .murc.example /etc/murc
